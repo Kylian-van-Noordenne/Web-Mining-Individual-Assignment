@@ -1,0 +1,791 @@
+---
+title: "IndividualAssignment_450752"
+author: "Kylian van Noordenne - 450752"
+date: "26-6-2021"
+output: html_document
+---
+
+## Data preparation 
+
+```{r}
+# Load libraries
+library(readxl)
+library(dplyr)
+library(rsample)
+library(tidymodels)
+library(ggplot2)
+library(doParallel)
+library(tidyverse)
+library(vip)
+library(DALEXtra)
+library(yardstick)
+library(ranger)
+library(themis)
+library(skimr)
+library(knitr)
+```
+
+```{r}
+# Set working directory
+setwd("~/BIM/Web Mining and Analytics/Individual assignment")
+
+# Load the data
+Data <- read_excel("210625_Team9_Data.xlsx")
+```
+
+```{r}
+# Top review
+Data$topReview <- as.factor(ifelse(Data$rating == 5, 1,0))
+table(Data$topReview)
+```
+
+```{r}
+# Number of characters
+Data$characters <- nchar(Data$text)
+```
+
+```{r}
+# Check the structure
+str(Data)
+```
+
+```{r}
+# Change structure of certain variables
+Data$location <- as.factor(Data$location)
+Data$price <- as.factor(Data$price)
+Data$year <- as.factor(Data$year)
+Data$Prob_Covid <- as.numeric(Data$Prob_Covid)
+Data$Prob_Environment <- as.numeric(Data$Prob_Environment)
+Data$Prob_Seafood <- as.numeric(Data$Prob_Seafood)
+Data$characters <- as.numeric(Data$characters)
+```
+
+```{r}
+# Scale the probabilities
+Data$Prob_Covid <- scale(Data$Prob_Covid)
+Data$Prob_Environment <- scale(Data$Prob_Environment)
+Data$Prob_Seafood <- scale(Data$Prob_Seafood)
+```
+
+```{r}
+# Remove certain variables
+Data$averagerating <- NULL
+Data$totalreviews <- NULL
+```
+
+```{r}
+# Replace the two NA values with the mean
+Data$Prob_Environment[is.na(Data$Prob_Environment)] <- mean(Data$Prob_Environment, na.rm = TRUE)
+Data$Prob_Seafood[is.na(Data$Prob_Seafood)] <- mean(Data$Prob_Seafood, na.rm = TRUE)
+```
+
+```{r}
+summary(Data)
+```
+
+```{r}
+skim(Data) %>%
+  knit_print()
+```
+
+```{r}
+# Test/train 
+set.seed(240298) ## This generates a random order
+splits <- initial_split(Data, prop = 0.8) ## 80% will be training data
+
+# Create a train and test set
+Data_train <- training(splits)
+Data_test <- testing(splits)
+# Check whether the proportion of positives and negatives is similar
+
+Data_train %>% count(topReview) %>%
+  mutate(prop = n / sum(n))
+Data_test %>% count(topReview) %>%
+  mutate(prop = n / sum(n))
+```
+
+## Logistic Regression
+
+```{r}
+# Set up the recipe
+lr_mod <- logistic_reg() %>%
+  set_engine("glm")
+```
+
+Create my recipe
+```{r}
+# Set up the recipe
+lr_mod_recipe <- recipe(topReview ~ location + price + year + month + Negative_SentiStrength_Score + Positive_SentiStrength_Score + photos + totalReviews + Prob_Covid + Prob_Environment + Prob_Seafood + characters,
+                        data = Data_train) 
+
+```
+
+Create a workflow
+```{r}
+# Create a workflow
+lr_mod_workflow <- 
+  workflow() %>%
+  add_model(lr_mod) %>%
+  add_recipe(lr_mod_recipe) 
+```
+
+```{r}
+# Fit the workflow to the data
+lr_fit <-
+  lr_mod_workflow %>%
+  fit(data = Data_train)
+```
+
+Retrieve the specified workflow
+```{r}
+# Logisitc regression esitmates
+lr_fit %>%
+  pull_workflow_fit() %>%
+  tidy()
+```
+
+Predict based on the specified workflow
+```{r}
+# Predict the class
+lr_predict_class <- predict(lr_fit, Data_test, type = "class") %>%
+  bind_cols(Data_test %>% dplyr::select(topReview))
+lr_predict_class
+# Predict the probability
+lr_predict_prob <- predict(lr_fit, Data_test, type = "prob") %>%
+  bind_cols(Data_test %>% dplyr::select(topReview))
+lr_predict_prob
+```
+
+```{r}
+# Confusion matrix
+tbl <- table(lr_predict_class$.pred_class, observed = lr_predict_class$topReview)
+tbl
+```
+
+```{r}
+# Compute the performance criteria
+TP <- tbl[2, 2] ## True positives
+TN <- tbl[1, 1] ## True negatives
+FP <- tbl[2, 1] ## False positives
+FN <- tbl[1, 2] ## False negatives
+
+Accuracy <- (TP + TN) / sum(tbl)
+Sensitivity <- TP / (TP + FN)
+Specificity <- TN / (FP + TN)
+Precision <- FP / (FP + TP)
+Recall <- TN / (TN + FN)
+
+# Show the results
+round(cbind(Accuracy, Sensitivity, Specificity, Precision, Recall), 3)
+```
+
+```{r}
+# F-score
+(2 * Precision * Recall) / (Precision + Recall)
+```
+
+Below I will plot the ROC curve and gain the AUC value. The AUC tells how much the value is capable of distinguishing between classes. The higher the value (max of 1), the better the model is at predicting negatives as negatives and positives as positives. 
+
+```{r}
+lr_predict_prob %>%
+  roc_curve(truth = topReview, .pred_0) %>%
+  autoplot()
+```
+
+```{r}
+lr_predict_prob %>%
+  roc_auc(truth = topReview, .pred_0)
+```
+
+## Standard Random forest
+```{r}
+splits
+```
+
+```{r}
+set.seed(123456)
+cv_folds <- Data_train %>% vfold_cv(v = 4, strata = topReview)
+```
+
+```{r}
+rf_mod_recipe <- recipe(topReview ~ location + price + year + month + Negative_SentiStrength_Score + Positive_SentiStrength_Score + photos + totalReviews + Prob_Covid + Prob_Environment + Prob_Seafood + characters,
+                        data = Data_train) 
+```
+
+The ranger package is used as computational engine. The mtry = tune() which determines the number of features considered at each split.
+```{r}
+# Specify the random forest
+rf_mod <- rand_forest(mtry = tune(), min_n = tune(), trees = 200) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "permutation")
+```
+
+Increasing the trees does not seem to lead to a better result. For saving computation power trees of 200 are utilised. 
+```{r}
+# Create a workflow
+rf_mod_workflow <-  workflow() %>%
+  add_model(rf_mod) %>%
+  add_recipe(rf_mod_recipe) 
+rf_mod_workflow
+```
+```{r}
+class_metrics <- metric_set(accuracy, yardstick::sensitivity, roc_auc,
+                            yardstick::f_meas, yardstick::specificity, yardstick::recall)
+```
+
+```{r}
+# create a tune grid
+rf_grid <- grid_regular(
+  mtry(range = c(1, 10)),
+  min_n(range = c(1, 100)),
+  levels = 15
+)
+rf_grid
+```
+Make the computation faster by doing register do parallel
+```{r}
+registerDoParallel()
+```
+
+```{r}
+# Train the model
+set.seed(654321)
+rf_tune_res <- tune_grid(
+  rf_mod_workflow,
+  resamples = cv_folds,
+  grid = rf_grid,
+  metrics = class_metrics
+)
+```
+
+```{r}
+# Collect the specified metrics
+rf_tune_res %>%
+  collect_metrics()
+```
+
+```{r}
+# Visually inspect 
+rf_tune_res %>%
+  collect_metrics() %>%
+  filter(.metric %in% c("roc_auc", "accuracy")) %>%
+  ggplot(aes(x = mtry, y = mean, ymin = mean - std_err, ymax = mean + std_err, 
+             colour = .metric)) +
+  geom_errorbar() +
+  geom_line() +
+  geom_point() +
+  facet_grid(.metric ~., scales = "free_y")
+```
+
+```{r}
+# Visually inspect the hypertuning process
+rf_tune_res %>%
+  collect_metrics() %>%
+  filter(.metric %in% c("roc_auc")) %>%
+  mutate(min_n = factor(min_n)) %>%
+  ggplot(aes(x = mtry, y = mean, colour = min_n)) +
+  geom_line() +
+  geom_point() +
+  labs(y = "AUC") + 
+  scale_x_continuous(breaks = c(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)) + 
+  theme_bw()
+```
+
+```{r}
+# Assign the best hyperparameters to the final workflow
+best_auc <- select_best(rf_tune_res, "roc_auc")
+rf_final_wf <- finalize_workflow(rf_mod_workflow, best_auc)
+rf_final_wf
+```
+
+## Test set performance
+
+The model is tuned. We can use the trained finalized workflow and predict the test set
+```{r}
+set.seed(56789)
+rf_final_fit <- rf_final_wf %>%
+  last_fit(splits, metrics = class_metrics)
+```
+
+```{r}
+rf_final_fit %>% 
+  collect_predictions() %>%
+  conf_mat(truth = topReview, estimate = .pred_class)
+```
+Again the problem is that a lot of mistakes are that conversion is predicted, while no conversion happened. 
+
+```{r}
+# collect the final metrics
+rf_final_fit %>%
+  collect_metrics()
+```
+
+```{r}
+rf_vi_fit <- rf_final_wf %>%
+  fit(data = Data_train)
+```
+
+```{r}
+rf_vi_fit %>%
+  pull_workflow_fit() %>%
+  vi()
+```
+
+```{r}
+# Retrieve the variable importance
+rf_vi_fit %>%
+  pull_workflow_fit() %>%
+  vip(geom = "col", 
+      aesthetics = list(fill = "dark blue",  col = "black")) +
+  labs(title = "Random forest variable importance") +
+  theme_bw()
+  
+```
+ Partial dependence plots
+```{r}
+explainer <- explain_tidymodels(rf_vi_fit, data = Data_train, y = Data_train$topReview)
+```
+
+FACTOR VARIABLES
+```{r}
+set.seed(2402)
+pd_1 <- model_profile(explainer, type = "partial", variables = c("Positive_SentiStrength_Score"))
+
+# Create Plots
+as_tibble(pd_1$agr_profiles) %>%
+  ggplot(aes(x = pd_1$agr_profiles$'_x_' , y = pd_1$agr_profiles$'_yhat_', fill = pd_1$agr_profiles$'_yhat_' )) +
+  geom_bar(stat = "identity") +
+  labs(x = "Positive sentiment score", y = "Average predicted  probability", fill = "Probability")  + 
+  geom_text(aes(label = round(pd_1$agr_profiles$'_yhat_', digits = 2)), vjust = 2, size = 5, colour = "white") +
+  scale_fill_continuous(type = "gradient") +
+  theme_bw() +
+  theme(text = element_text(size = 14)) 
+```
+CONTINUOUS VARIABLES 
+
+```{r}
+set.seed(2402)
+pd_1 <- model_profile(explainer, variables = c("Prob_Seafood")) 
+pd_1
+
+# Create Plots
+as_tibble(pd_1$agr_profiles) %>%
+  ggplot(aes(x = pd_1$agr_profiles$'_x_' , y = pd_1$agr_profiles$'_yhat_', colour = pd_1$agr_profiles$'_yhat_' )) +
+  geom_line(size = 1.2) +
+  labs(x = "Scaled probability seafood appearance", y = "Average predicted probability", fill = "Probability")  + 
+  scale_colour_continuous(type = "gradient", name = "Probability") +
+  theme_bw() +
+  theme(text = element_text(size = 14))
+```
+
+## Oversampled Random forest
+```{r}
+splits
+```
+
+```{r}
+set.seed(123456)
+cv_folds <- Data_train %>% vfold_cv(v = 4, strata = topReview)
+```
+
+```{r}
+rf_mod_recipe <- recipe(topReview ~ location + price + year + month + Negative_SentiStrength_Score + Positive_SentiStrength_Score + photos + totalReviews + Prob_Covid + Prob_Environment + Prob_Seafood + characters,
+                        data = Data_train) %>%
+  step_upsample(topReview)
+```
+
+The ranger package is used as computational engine. The mtry = tune() which determines the number of features considered at each split.
+```{r}
+# Specify the random forest
+rf_mod <- rand_forest(mtry = tune(), min_n = tune(), trees = 200) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "permutation")
+```
+
+Increasing the trees does not seem to lead to a better result. For saving computation power trees of 200 are utilised. 
+```{r}
+# Create a workflow
+rf_mod_workflow <-  workflow() %>%
+  add_model(rf_mod) %>%
+  add_recipe(rf_mod_recipe) 
+rf_mod_workflow
+```
+
+```{r}
+class_metrics <- metric_set(accuracy, yardstick::sensitivity, roc_auc,
+                            yardstick::f_meas, yardstick::specificity, yardstick::recall)
+```
+
+```{r}
+# create a tune grid
+rf_grid <- grid_regular(
+  mtry(range = c(1, 10)),
+  min_n(range = c(1, 100)),
+  levels = 15
+)
+rf_grid
+```
+
+Make the computation faster by doing register do parallel
+```{r}
+registerDoParallel()
+```
+
+```{r}
+# Train the model
+set.seed(654321)
+rf_tune_res <- tune_grid(
+  rf_mod_workflow,
+  resamples = cv_folds,
+  grid = rf_grid,
+  metrics = class_metrics
+)
+```
+
+```{r}
+# Collect the specified metrics
+rf_tune_res %>%
+  collect_metrics()
+```
+
+```{r}
+# Visually inspect 
+rf_tune_res %>%
+  collect_metrics() %>%
+  filter(.metric %in% c("roc_auc", "accuracy")) %>%
+  ggplot(aes(x = mtry, y = mean, ymin = mean - std_err, ymax = mean + std_err, 
+             colour = .metric)) +
+  geom_errorbar() +
+  geom_line() +
+  geom_point() +
+  facet_grid(.metric ~., scales = "free_y")
+```
+
+```{r}
+# Visually inspect the hypertuning process
+rf_tune_res %>%
+  collect_metrics() %>%
+  filter(.metric %in% c("roc_auc")) %>%
+  mutate(min_n = factor(min_n)) %>%
+  ggplot(aes(x = mtry, y = mean, colour = min_n)) +
+  geom_line() +
+  geom_point() +
+  labs(y = "AUC") + 
+  theme_bw()
+```
+
+```{r}
+# Assign the best hyperparameters to the final workflow
+best_auc <- select_best(rf_tune_res, "roc_auc")
+rf_final_wf <- finalize_workflow(rf_mod_workflow, best_auc)
+rf_final_wf
+```
+
+## Test set performance
+
+The model is tuned. We can use the trained finalized workflow and predict the test set
+```{r}
+set.seed(56789)
+rf_final_fit <- rf_final_wf %>%
+  last_fit(splits, metrics = class_metrics)
+```
+
+```{r}
+rf_final_fit %>% 
+  collect_predictions() %>%
+  conf_mat(truth = topReview, estimate = .pred_class)
+```
+Again the problem is that a lot of mistakes are that conversion is predicted, while no conversion happened. 
+
+```{r}
+# collect the final metrics
+rf_final_fit %>%
+  collect_metrics()
+```
+
+```{r}
+rf_vi_fit <- rf_final_wf %>%
+  fit(data = Data_train)
+```
+
+
+```{r}
+# Retrieve the variable importance
+rf_vi_fit %>%
+  pull_workflow_fit() %>%
+  vip(geom = "col", 
+      aesthetics = list(fill = "dark red",  col = "black")) +
+  labs(title = "Random forest variable importance") +
+  theme_bw()
+  
+```
+
+## Neural Network
+```{r}
+# Create a recipe
+nn_mod_recipe <- recipe(topReview ~ location + price + year + month + Negative_SentiStrength_Score + Positive_SentiStrength_Score + photos + totalReviews + Prob_Covid + Prob_Environment + Prob_Seafood + characters,
+                        data = Data_train)  
+```
+
+```{r}
+# Nnet specifications
+nn_nnet_mlp <- mlp(hidden_units = tune(), 
+                   epochs = 50,
+                   dropout = 0.01)   %>% ## Epoch = how many times traiing vectors are used. Too less = underfitting too much = overfitting
+  set_engine("nnet", verbose = 0) %>%
+  set_mode("classification")
+nn_nnet_mlp
+```
+
+```{r}
+# Create a workflow
+nn_mlp_wf <- workflow() %>%
+  add_recipe(nn_mod_recipe) %>%
+  add_model(nn_nnet_mlp)
+```
+
+Again the same metrics
+```{r}
+class_metrics <- metric_set(accuracy, yardstick::sensitivity, roc_auc,
+                            yardstick::f_meas, yardstick::specificity, yardstick::recall)
+```
+
+```{r}
+# Tune the hidden units
+nn_grid <- tibble(hidden_units = 1:20)
+```
+
+Using the same cross validation
+```{r}
+# Cross validation folds
+set.seed(123456)
+cv_folds <- Data_train %>% vfold_cv(v = 4, strata = topReview)
+```
+
+```{r}
+registerDoParallel()
+```
+
+Perform training
+```{r}
+# Train the model
+set.seed(987436)
+nnet_tune_res <- tune_grid(
+  nn_mlp_wf,
+  resamples = cv_folds,
+  grid = nn_grid,
+  metrics = class_metrics
+)
+```
+
+```{r}
+# Collect the validation metrics
+nnet_tune_res %>%
+  collect_metrics()
+```
+
+```{r}
+nnet_tune_res %>%
+  collect_metrics() %>%
+  filter(.metric %in% c("roc_auc", "accuracy")) %>%
+  ggplot(aes(x = hidden_units, y = mean, ymin = mean - std_err, ymax = mean + std_err, 
+             colour = .metric)) +
+  geom_errorbar() +
+  geom_line() +
+  geom_point() +
+  facet_grid(.metric ~., scales = "free_y")
+```
+
+
+```{r}
+# Assign to the final workflow
+nn_best_auc <- select_best(nnet_tune_res, "roc_auc")
+nnet_final_wf <- finalize_workflow(nn_mlp_wf, nn_best_auc)
+nnet_final_wf
+```
+
+## Test set performance
+
+The model is tuned. We can use the trained finalized workflow and predict the test set
+```{r}
+# Predict the test set
+set.seed(56789)
+nnet_final_fit <- nnet_final_wf %>%
+  last_fit(splits, metrics = class_metrics)
+```
+
+```{r}
+# Confusion matrix
+nnet_final_fit %>% 
+  collect_predictions() %>%
+  conf_mat(truth = topReview, estimate = .pred_class)
+```
+Again the problem is that a lot of mistakes are that conversion is predicted, while no conversion happened. 
+
+```{r}
+# Collect the specified metrics
+nnet_final_fit %>%
+  collect_metrics()
+```
+
+
+##K-nearest neighbor Regression
+
+Setting up a grid
+```{r}
+knn_regr_tune_grid <- tibble(neighbors = 1:35*3 - 1)
+knn_regr_tune_grid
+```
+
+###Specifying corresponding workflow
+
+Here the specification of the knn-model is given. The mode is set to 'regression', instead of 'classification', because the price variable we will be working with is numeric and not logistic variable. Moreover, the computational engine is set with set_engine().
+```{r}
+knn_regr_mod <- nearest_neighbor(neighbors = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("kknn", scale = FALSE)
+```
+
+Through the following command you can see that this model is used for training the model
+```{r}
+knn_regr_mod %>% translate()
+```
+
+###Specifying the recipe for the knn-model
+Creating the recipe, and ensuring normalization of all predictors.
+
+```{r}
+knn_regr_recipe <- 
+  recipe(topReview ~ month + Negative_SentiStrength_Score + Positive_SentiStrength_Score + photos + totalReviews + Prob_Covid + Prob_Environment + Prob_Seafood + characters, data = Data_train) %>% 
+  step_normalize(all_predictors())
+```
+
+Overview of the recipe
+```{r}
+knn_regr_recipe
+```
+
+
+```{r}
+Data_train_baked <- knn_regr_recipe %>% prep(Data_train) %>% bake(Data_train)
+Data_train_baked %>% head()
+```
+
+The workflow then is:
+```{r}
+knn_regr_workflow <-
+  workflow() %>% 
+  add_model(knn_regr_mod) %>% 
+  add_recipe(knn_regr_recipe)
+knn_regr_workflow
+```
+
+The 'data_train_baked' can be removed because it is not necessary anymore
+```{r}
+rm(Data_train_baked)
+```
+
+
+##Tuning the number of nearest neighbors
+
+A grid search is used to search over the grid for potential values, by using a cross-validation set as follows:
+```{r}
+knn_regr_tune_res <- knn_regr_workflow %>% 
+  tune_grid(resamples = cv_folds, 
+            grid = knn_regr_tune_grid,
+            metrics = class_metrics)
+```
+
+The metrics specified in the previous command can be collected as follows:
+```{r}
+knn_regr_tune_res %>% collect_metrics()
+```
+
+These metrics can be plotted as well
+```{r}
+knn_regr_tune_res %>% collect_metrics() %>% 
+  ggplot(aes(x = neighbors, y = mean)) + 
+  geom_point() + geom_line() + 
+  facet_wrap(~ .metric, scales = "free_y")
+```
+
+Using the validation set, we can select the best k neighbors, by looking at the different metrics
+```{r}
+knn_regr_tune_res %>% 
+  show_best("roc_auc", n = 3) %>% 
+  arrange(neighbors)
+```
+
+
+##Finalizing the workflow
+
+Before the workflow can be finalized, the information which shows which model has the best value for the tuning parameter
+```{r}
+knn_regr_best_model <- select_best(knn_regr_tune_res, metric = "roc_auc")
+knn_regr_best_model
+```
+
+A finalized workflow, which specifies which k neighbors parameter that is used from now on (the best performing number of k-neighbors)
+```{r}
+knn_regr_workflow_final <- 
+  knn_regr_workflow %>% 
+  finalize_workflow(knn_regr_best_model)
+```
+
+This can be retained on the entire training set as follows:
+```{r}
+knn_regr_workflow_final %>% fit(data = Data_train)
+```
+
+
+```{r}
+# Predict the test set
+set.seed(56789)
+knn_final_fit <- knn_regr_workflow_final %>%
+  last_fit(splits, metrics = class_metrics)
+```
+
+```{r}
+# Confusion matrix
+knn_final_fit %>% 
+  collect_predictions() %>%
+  conf_mat(truth = topReview, estimate = .pred_class)
+```
+ 
+
+```{r}
+# Collect the specified metrics
+knn_final_fit %>%
+  collect_metrics()
+```
+
+## Correlation + additional plots
+
+```{r}
+Part <- Data[,2:22]
+Part$name <- NULL
+Part$url <- NULL
+Part$rating <- NULL
+Part$date_review <- NULL
+Part$text <- NULL
+Part$averageRating <- NULL
+Part$Topic <- NULL
+Part$Average_SentiStrength_Score <- NULL
+
+```
+
+
+```{r}
+numerical_data <-Part %>% select(where(is.numeric))
+
+library(corrplot)
+corrplot(cor(numerical_data), type = "upper", 
+         order = "hclust",
+         tl.cex = 1,
+         number.cex = 0.75,
+         tl.srt = 40)
+```
+Save the dataframe
+```{r}
+writexl::write_xlsx(Part, "Used_Data.xlsx")
+```
